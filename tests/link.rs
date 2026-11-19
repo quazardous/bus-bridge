@@ -305,10 +305,7 @@ fn entries_that_left_the_window_meanwhile_are_reported_lost() {
     }
     until("b hears the last", || hb.lock().unwrap().contains(&10));
     assert!(
-        seen.lock()
-            .unwrap()
-            .iter()
-            .any(|e| *e == LinkEvent::Lost(Lost::Gap)),
+        seen.lock().unwrap().contains(&LinkEvent::Lost(Lost::Gap)),
         "the gap reported"
     );
     assert_eq!(*hb.lock().unwrap(), [0, 7, 8, 9, 10], "the window kept");
@@ -479,8 +476,7 @@ mod unix {
         assert!(
             seen.lock()
                 .unwrap()
-                .iter()
-                .any(|e| *e == LinkEvent::Lost(Lost::Restarted))
+                .contains(&LinkEvent::Lost(Lost::Restarted))
         );
         assert_eq!(*hb.lock().unwrap(), [1, 2]);
     }
