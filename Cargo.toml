@@ -1,0 +1,38 @@
+[package]
+name = "bus-bridge"
+version = "0.1.0"
+description = "Reference transports for bus-contract's crossing contract: a link that carries relayable events and requests between two buses, in one process or over a Unix socket, with reconnection from a cursor and bounded in-flight work"
+readme = "README.md"
+keywords = ["event-bus", "ipc", "bus-contract", "relay", "unix-socket"]
+categories = ["rust-patterns", "concurrency"]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quazardous/bus-bridge"
+homepage = "https://github.com/quazardous/bus-bridge"
+documentation = "https://docs.rs/bus-bridge"
+authors = ["The bus-bridge contributors"]
+
+[features]
+# `bus_bridge::unix`: the Unix socket transport.
+unix = []
+
+[dependencies]
+bus-contract = "0.5.0"
+bus-contract-crossing = "0.2.0"
+bus-contract-journal = "0.2.0"
+
+[dev-dependencies]
+# Two kernels to join, and the crossing conformance group run across
+# the link.
+bus-kernel = { version = "0.3.1", features = ["conformance"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
