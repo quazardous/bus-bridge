@@ -17,6 +17,18 @@ use bus_contract_crossing::{
 /// refused at the handshake.
 pub const PROTOCOL: u32 = 1;
 
+/// The `resume` of a [`Frame::Hello`] that asks the peer to start from
+/// its present ([`crate::Start::Present`]): run 0 ("read nothing yet")
+/// with a number no journal reaches. The peer answers with an empty
+/// [`Frame::Entries`] whose `next` is its cursor, then sends what it
+/// journals after it. A peer older than 0.2.1 reads it as a cursor of
+/// another run: it sends its whole window, reported as
+/// `Lost::Restarted`.
+pub const RESUME_PRESENT: Cursor = Cursor {
+    run: 0,
+    seq: u64::MAX,
+};
+
 /// The largest frame a link reads: a bigger one is a broken or hostile
 /// peer, and the connection is dropped.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;

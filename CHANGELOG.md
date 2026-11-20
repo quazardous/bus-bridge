@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.1
+
+- A fact crosses an idle link at once: the sending side no longer
+  sleeps a quarter of `Config::poll` (5 ms by default) after its
+  journal woke it with a new entry. An entry the relay does not send
+  wakes it once, not in a loop.
+- `Config::start` (a `Start`, `Config::start(..)`): where an end starts
+  reading the peer's journal before it has taken anything.
+  `Start::Oldest` (the default, as before) sends the peer's whole
+  window; `Start::Present` sends only what the peer journals after the
+  first handshake, so a process attaching to a long-running peer does
+  not hear its past again; `Start::At(cursor)` resumes exactly from a
+  cursor saved earlier (`LinkStats::taken`). Reconnections resume from
+  the cursor taken, as before. `LinkEvent::FromPresent { cursor }`
+  reports the peer's present, before any entry after it is taken in.
+- `Config::send_entries` (`Config::receive_only()`): an end that takes
+  the peer's entries in and sends none of its own, for a link that
+  carries facts one way.
+- `wire::RESUME_PRESENT`: the handshake's request to start from the
+  peer's present. The wire protocol is unchanged; a 0.2.0 peer reads the
+  request as a cursor of another run and sends its whole window,
+  reported as `Lost::Restarted`.
+
 ## 0.2.0
 
 - Peer check on every connection, on the accepting and the dialing

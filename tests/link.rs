@@ -13,7 +13,7 @@ use bus_bridge::bus_contract::{
 use bus_bridge::bus_contract_crossing::{Codec, Lost, Origin, Relayed, RelayedRequest, relayable};
 use bus_bridge::transport::{Accept, Dial, Stream, memory as pipe};
 use bus_bridge::wire::Outcome;
-use bus_bridge::{Config, Endpoint, Flow, LinkError, LinkEvent, PeerIdentity, PeerPolicy};
+use bus_bridge::{Config, Endpoint, Flow, LinkError, LinkEvent, PeerIdentity, PeerPolicy, Start};
 use bus_kernel::{BusJournal, Kernel};
 
 /// A relayable event.
@@ -281,6 +281,117 @@ fn a_reconnection_resumes_from_the_cursor_without_duplicates() {
     assert_eq!(*hb.lock().unwrap(), [1, 2, 3], "each once, in order");
     assert!(eb.stats().connections >= 2, "reconnected");
     assert_eq!(eb.stats().lost, 0);
+}
+
+#[test]
+fn a_fact_crosses_an_idle_link_at_once() {
+    let (a, b) = (bus(1024), bus(1024));
+    let (tx, rx) = std::sync::mpsc::channel::<(u32, Instant)>();
+    let tx = Mutex::new(tx);
+    b.listen::<Synced>("test.timed", ListenOpts::new(), move |n, _| {
+        let _ = tx.lock().unwrap().send((*n, Instant::now()));
+        Ok(())
+    })
+    .unwrap();
+    // A slow poll on the sending side: a pump that sleeps after its
+    // journal woke it would show it plainly (a quarter of the poll,
+    // 50 ms, on every fact).
+    let mut config = Config::new("a", Origin::process("b"));
+    config.poll = Duration::from_millis(200);
+    let (_eb, _ea) = join(&b, &a, config, pipe::pair());
+    let journal = a.journal().unwrap();
+    let mut took = Vec::new();
+    for n in 0..30 {
+        // Idle: the pump is waiting on the journal.
+        thread::sleep(Duration::from_millis(5));
+        let sent = Instant::now();
+        journal.publish::<Synced>(n).unwrap();
+        let (heard, at) = rx.recv_timeout(WAIT).expect("the fact crosses");
+        assert_eq!(heard, n);
+        took.push(at - sent);
+    }
+    took.sort();
+    let p50 = took[took.len() / 2];
+    // Well under a millisecond on an idle machine; the bound is loose
+    // for a loaded CI runner, and still far below the 50 ms floor.
+    assert!(p50 < Duration::from_millis(10), "p50 {p50:?}, all {took:?}");
+}
+
+#[test]
+fn a_first_connection_can_start_from_the_peer_present() {
+    let (a, b) = (bus(1024), bus(1024));
+    let hb = heard(&b);
+    let journal = a.journal().unwrap();
+    for n in 1..=5 {
+        journal.publish::<Synced>(n).unwrap();
+    }
+    let config = b_config()
+        .start(Start::Present)
+        .reconnect(Duration::from_millis(50));
+    let ea = Endpoint::new(a.clone(), Config::new("a", Origin::process("b"))).unwrap();
+    let eb = Endpoint::new(b.clone(), config).unwrap();
+    let seen = events(&eb);
+    let (dial, accept) = pipe::pair();
+    ea.accept(accept);
+    eb.connect(dial);
+    assert!(ea.wait_connected(WAIT) && eb.wait_connected(WAIT));
+    // The peer's present is taken at the handshake, before anything
+    // new is sent.
+    until("b took a's present", || eb.stats().taken.seq == 5);
+    let from = seen.lock().unwrap().iter().find_map(|e| match e {
+        LinkEvent::FromPresent { cursor } => Some(*cursor),
+        _ => None,
+    });
+    assert_eq!(from, Some(eb.stats().taken), "reported");
+
+    // A reconnection with nothing sent meanwhile resumes from there,
+    // not from the oldest entry.
+    eb.disconnect();
+    until("down", || !ea.stats().connected);
+    assert!(eb.wait_connected(WAIT) && ea.wait_connected(WAIT));
+    journal.publish::<Synced>(6).unwrap();
+    until("b hears 6", || *hb.lock().unwrap() == [6]);
+
+    // And from the cursor taken once entries were sent.
+    eb.disconnect();
+    until("down again", || !ea.stats().connected);
+    journal.publish::<Synced>(7).unwrap();
+    until("b hears 7", || hb.lock().unwrap().len() == 2);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(*hb.lock().unwrap(), [6, 7], "none of the past, each once");
+    assert_eq!(eb.stats().lost, 0);
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, LinkEvent::Lost(_))),
+        "nothing reported lost"
+    );
+
+    // A cursor saved earlier resumes exactly, on a new endpoint.
+    let saved = eb.stats().taken;
+    drop((ea, eb));
+    journal.publish::<Synced>(8).unwrap();
+    let c = bus(1024);
+    let hc = heard(&c);
+    let (_ea, _ec) = join(&a, &c, b_config().start(Start::At(saved)), pipe::pair());
+    until("c hears 8", || *hc.lock().unwrap() == [8]);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(*hc.lock().unwrap(), [8], "only what came after the cursor");
+}
+
+#[test]
+fn a_receive_only_end_takes_in_and_sends_nothing() {
+    let (a, b) = (bus(1024), bus(1024));
+    let (ha, hb) = (heard(&a), heard(&b));
+    let (_ea, _eb) = join(&a, &b, b_config().receive_only(), pipe::pair());
+    b.journal().unwrap().publish::<Synced>(1).unwrap();
+    a.journal().unwrap().publish::<Synced>(2).unwrap();
+    until("b hears 2", || hb.lock().unwrap().contains(&2));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(*ha.lock().unwrap(), [2], "b sent nothing");
+    assert_eq!(*hb.lock().unwrap(), [1, 2]);
 }
 
 #[test]

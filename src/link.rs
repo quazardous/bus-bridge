@@ -63,6 +63,38 @@ pub struct Config {
     /// default; [`PeerPolicy::Any`] is unsafe on a host with several
     /// users.
     pub peer_policy: PeerPolicy,
+    /// Where this end starts reading the peer's journal on its first
+    /// connection ([`Start`]): [`Start::Oldest`] by default. Once
+    /// entries were taken, reconnections resume exactly from the cursor
+    /// taken, whatever this says.
+    pub start: Start,
+    /// Whether this end sends its bus's relayable entries to the peer.
+    /// On by default; off ([`Config::receive_only`]), the link carries
+    /// entries one way only: this end takes the peer's in, answers its
+    /// asks and sends its own, but its own entries stay here.
+    pub send_entries: bool,
+}
+
+/// Where an end starts reading the peer's journal before it has taken
+/// anything ([`Config::start`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Start {
+    /// From the oldest entry the peer still keeps: its whole window is
+    /// sent (the default).
+    #[default]
+    Oldest,
+    /// From the peer's present: only entries the peer journals after
+    /// the first handshake are sent, none of its past. For a process
+    /// that attaches to a long-running peer and follows its state some
+    /// other way (it reads that state, then follows the facts). A peer
+    /// older than bus-bridge 0.2.1 does not know this request and sends
+    /// its whole window, reported as [`Lost::Restarted`].
+    Present,
+    /// From a cursor saved earlier ([`LinkStats::taken`]), exactly as a
+    /// reconnection resumes: entries after it are sent, entries that
+    /// left the peer's window meanwhile are reported lost.
+    At(Cursor),
 }
 
 impl Config {
@@ -80,7 +112,24 @@ impl Config {
             call_timeout: Duration::from_secs(5),
             trust_claimed_origin: false,
             peer_policy: PeerPolicy::SameUser,
+            start: Start::Oldest,
+            send_entries: true,
         }
+    }
+
+    /// Sending none of this end's entries to the peer
+    /// ([`Config::send_entries`]): a follower that only takes the
+    /// peer's facts in.
+    pub fn receive_only(mut self) -> Config {
+        self.send_entries = false;
+        self
+    }
+
+    /// Starting from elsewhere than the peer's oldest entry
+    /// ([`Config::start`]).
+    pub fn start(mut self, start: Start) -> Config {
+        self.start = start;
+        self
     }
 
     /// With another peer policy ([`Config::peer_policy`]).
@@ -168,6 +217,15 @@ pub enum LinkEvent {
         /// Why.
         reason: String,
     },
+    /// This end asked to start from the peer's present
+    /// ([`Start::Present`]) and the peer answered with it: entries after
+    /// `cursor` will be taken in, none before. Reported before any of
+    /// them is, so a sink can draw the line between what came by another
+    /// way and what comes by the link.
+    FromPresent {
+        /// The peer's cursor at the handshake.
+        cursor: Cursor,
+    },
 }
 
 /// A link's counters at a moment ([`Endpoint::stats`]).
@@ -233,6 +291,9 @@ struct State {
     taken: Cursor,
     /// Where the next entries sent start, in this end's journal.
     out: Cursor,
+    /// This connection's handshake asked for the peer's present, not
+    /// answered yet.
+    asked_present: bool,
     entries_in_flight: usize,
     asks: HashMap<(u64, u64), Sender<RelayedAnswer>>,
     asks_in_flight: usize,
@@ -310,12 +371,19 @@ impl Endpoint {
         if bus.relay().is_none() {
             return Err(LinkError::NoRelay);
         }
+        let state = State {
+            taken: match config.start {
+                Start::At(cursor) => cursor,
+                Start::Oldest | Start::Present => Cursor::START,
+            },
+            ..State::default()
+        };
         Ok(Endpoint {
             inner: Arc::new(Inner {
                 bus,
                 config,
                 closed: AtomicBool::new(false),
-                state: Mutex::default(),
+                state: Mutex::new(state),
                 changed: Condvar::new(),
                 sinks: RwLock::default(),
                 next_call: AtomicU64::new(1),
@@ -566,7 +634,15 @@ impl Inner {
             });
             s.conn = Some(conn.clone());
             s.ready = false;
-            (conn, s.taken)
+            // Nothing taken yet and asked to start from the peer's
+            // present: say so; the peer answers with its cursor.
+            let resume = if s.taken == Cursor::START && self.config.start == Start::Present {
+                wire::RESUME_PRESENT
+            } else {
+                s.taken
+            };
+            s.asked_present = resume == wire::RESUME_PRESENT;
+            (conn, resume)
         };
         if self.is_closed() {
             conn.shutdown();
@@ -622,15 +698,32 @@ impl Inner {
                         "the peer speaks protocol {protocol}, this end {PROTOCOL}"
                     ));
                 }
+                // The peer starts from this end's present: it is sent the
+                // cursor now (an empty frame), so that a reconnection
+                // resumes from there even if nothing was sent meanwhile.
+                let present = (resume == wire::RESUME_PRESENT).then(|| self.relay().cursor());
                 {
                     let mut s = self.lock();
-                    s.out = resume;
+                    s.out = present.unwrap_or(resume);
                     s.entries_in_flight = 0;
                     s.ready = true;
+                }
+                if let Some(next) = present {
+                    let frame = Frame::Entries {
+                        entries: Vec::new(),
+                        lost: None,
+                        next,
+                    };
+                    if !conn.send(&frame) {
+                        return Err("the peer's present could not be sent".to_owned());
+                    }
                 }
                 self.connections.fetch_add(1, Ordering::Relaxed);
                 self.changed.notify_all();
                 self.emit(&LinkEvent::Connected { peer: name });
+                if !self.config.send_entries {
+                    return Ok(());
+                }
                 let (inner, conn) = (self.clone(), conn.clone());
                 thread::Builder::new()
                     .name("bus-bridge-pump".into())
@@ -642,6 +735,10 @@ impl Inner {
                 lost,
                 next,
             } => {
+                let asked_present = std::mem::take(&mut self.lock().asked_present);
+                if asked_present && entries.is_empty() && lost.is_none() {
+                    self.emit(&LinkEvent::FromPresent { cursor: next });
+                }
                 if let Some(lost) = lost {
                     self.lost.fetch_add(1, Ordering::Relaxed);
                     self.emit(&LinkEvent::Lost(lost));
@@ -764,6 +861,10 @@ impl Inner {
         let relay = self.relay();
         let journal = self.bus.journal();
         let max = self.config.max_in_flight;
+        // The last journal number a wait returned: the next wait is for
+        // a newer one, so an entry the relay does not send (not
+        // relayable) wakes the pump once, not in a loop.
+        let mut seen = 0;
         loop {
             let (from, room) = {
                 let mut s = self.lock();
@@ -794,10 +895,18 @@ impl Inner {
             let read = relay.resume(from, room.min(self.config.batch));
             if read.entries.is_empty() && read.lost.is_none() {
                 self.lock().out = read.next;
-                let woke = journal.map(|j| j.wait(&[], read.next.seq, self.config.poll));
-                if read.next == from && !matches!(woke, Some(None)) {
-                    // Nothing new, or a journal that cannot wait: do not spin.
+                if read.next.run != from.run {
+                    seen = 0;
+                }
+                let Some(journal) = journal else {
+                    // A journal that cannot wait: do not spin.
                     thread::sleep(self.config.poll / 4);
+                    continue;
+                };
+                // A new entry wakes the pump, which reads it at once;
+                // a wait that times out reads again too.
+                if let Some(entry) = journal.wait(&[], read.next.seq.max(seen), self.config.poll) {
+                    seen = entry.seq;
                 }
                 continue;
             }

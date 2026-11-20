@@ -26,6 +26,11 @@ reference implementation).
   took up to. Entries that left the sender's window meanwhile, or that
   a restarted sender no longer has, are reported (`LinkEvent::Lost` with
   `Lost::Gap` or `Lost::Restarted`), not silently skipped.
+- **Start where you choose.** A first connection reads the peer's
+  whole window by default; `Config::start(Start::Present)` starts from
+  the peer's present instead (for a process that attaches to a
+  long-running peer), and `Start::At(cursor)` from a cursor saved
+  earlier.
 - **Back-pressure.** A bound on work in flight per flow
   (`Config::max_in_flight`): entries sent and not yet taken, asks sent
   and not yet answered, peer asks being answered. A full flow waits and
