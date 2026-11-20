@@ -68,6 +68,11 @@ pub struct Config {
     /// entries were taken, reconnections resume exactly from the cursor
     /// taken, whatever this says.
     pub start: Start,
+    /// Whether this end sends its bus's relayable entries to the peer.
+    /// On by default; off ([`Config::receive_only`]), the link carries
+    /// entries one way only: this end takes the peer's in, answers its
+    /// asks and sends its own, but its own entries stay here.
+    pub send_entries: bool,
 }
 
 /// Where an end starts reading the peer's journal before it has taken
@@ -108,7 +113,16 @@ impl Config {
             trust_claimed_origin: false,
             peer_policy: PeerPolicy::SameUser,
             start: Start::Oldest,
+            send_entries: true,
         }
+    }
+
+    /// Sending none of this end's entries to the peer
+    /// ([`Config::send_entries`]): a follower that only takes the
+    /// peer's facts in.
+    pub fn receive_only(mut self) -> Config {
+        self.send_entries = false;
+        self
     }
 
     /// Starting from elsewhere than the peer's oldest entry
@@ -707,6 +721,9 @@ impl Inner {
                 self.connections.fetch_add(1, Ordering::Relaxed);
                 self.changed.notify_all();
                 self.emit(&LinkEvent::Connected { peer: name });
+                if !self.config.send_entries {
+                    return Ok(());
+                }
                 let (inner, conn) = (self.clone(), conn.clone());
                 thread::Builder::new()
                     .name("bus-bridge-pump".into())

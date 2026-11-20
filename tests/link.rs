@@ -382,6 +382,19 @@ fn a_first_connection_can_start_from_the_peer_present() {
 }
 
 #[test]
+fn a_receive_only_end_takes_in_and_sends_nothing() {
+    let (a, b) = (bus(1024), bus(1024));
+    let (ha, hb) = (heard(&a), heard(&b));
+    let (_ea, _eb) = join(&a, &b, b_config().receive_only(), pipe::pair());
+    b.journal().unwrap().publish::<Synced>(1).unwrap();
+    a.journal().unwrap().publish::<Synced>(2).unwrap();
+    until("b hears 2", || hb.lock().unwrap().contains(&2));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(*ha.lock().unwrap(), [2], "b sent nothing");
+    assert_eq!(*hb.lock().unwrap(), [1, 2]);
+}
+
+#[test]
 fn entries_that_left_the_window_meanwhile_are_reported_lost() {
     let (a, b) = (bus(4), bus(1024));
     let hb = heard(&b);

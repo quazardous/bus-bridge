@@ -15,6 +15,9 @@
   cursor saved earlier (`LinkStats::taken`). Reconnections resume from
   the cursor taken, as before. `LinkEvent::FromPresent { cursor }`
   reports the peer's present, before any entry after it is taken in.
+- `Config::send_entries` (`Config::receive_only()`): an end that takes
+  the peer's entries in and sends none of its own, for a link that
+  carries facts one way.
 - `wire::RESUME_PRESENT`: the handshake's request to start from the
   peer's present. The wire protocol is unchanged; a 0.2.0 peer reads the
   request as a cursor of another run and sends its whole window,
