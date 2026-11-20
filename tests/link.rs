@@ -11,9 +11,9 @@ use bus_bridge::bus_contract::{
     Bus, Facet, HookError, ListenOpts, Point, PointDecl, PointId, PointKey, PointKind, declare_all,
 };
 use bus_bridge::bus_contract_crossing::{Codec, Lost, Origin, Relayed, RelayedRequest, relayable};
-use bus_bridge::transport::{Accept, Dial, memory as pipe};
+use bus_bridge::transport::{Accept, Dial, Stream, memory as pipe};
 use bus_bridge::wire::Outcome;
-use bus_bridge::{Config, Endpoint, Flow, LinkError, LinkEvent};
+use bus_bridge::{Config, Endpoint, Flow, LinkError, LinkEvent, PeerIdentity, PeerPolicy};
 use bus_kernel::{BusJournal, Kernel};
 
 /// A relayable event.
@@ -401,6 +401,141 @@ fn an_ask_past_its_deadline_is_refused_when_the_bound_stays_full() {
     assert!(first.join().unwrap().refused.is_some(), "too slow");
 }
 
+/// The test seam for peer credentials: a connection that reports the
+/// peer as `uid`, whoever it is.
+struct Forged {
+    inner: Box<dyn Stream>,
+    uid: u32,
+}
+
+impl std::io::Read for Forged {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Write for Forged {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Stream for Forged {
+    fn try_clone_stream(&self) -> std::io::Result<Box<dyn Stream>> {
+        Ok(Box::new(Forged {
+            inner: self.inner.try_clone_stream()?,
+            uid: self.uid,
+        }))
+    }
+    fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+    fn peer_identity(&self) -> std::io::Result<PeerIdentity> {
+        Ok(PeerIdentity::Uid(self.uid))
+    }
+}
+
+struct ForgedDial<D>(D, u32);
+impl<D: Dial> Dial for ForgedDial<D> {
+    fn dial(&self) -> std::io::Result<Box<dyn Stream>> {
+        Ok(Box::new(Forged {
+            inner: self.0.dial()?,
+            uid: self.1,
+        }))
+    }
+}
+
+struct ForgedAccept<A>(A, u32);
+impl<A: Accept> Accept for ForgedAccept<A> {
+    fn accept(&self, wait: Duration) -> std::io::Result<Option<Box<dyn Stream>>> {
+        Ok(self
+            .0
+            .accept(wait)?
+            .map(|inner| Box::new(Forged { inner, uid: self.1 }) as Box<dyn Stream>))
+    }
+}
+
+/// A uid no test runs as.
+const STRANGER: u32 = 4_000_000_000;
+
+fn refused(seen: &Mutex<Vec<LinkEvent>>) -> bool {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, LinkEvent::Refused { .. }))
+}
+
+#[test]
+fn a_peer_of_another_user_is_refused_by_the_dialing_side() {
+    let (a, b) = (bus(1024), bus(1024));
+    let hb = heard(&b);
+    let (dial, accept) = pipe::pair();
+    let ea = Endpoint::new(a.clone(), Config::new("a", Origin::process("b"))).unwrap();
+    let eb = Endpoint::new(b.clone(), b_config().reconnect(Duration::from_millis(20))).unwrap();
+    let seen = events(&eb);
+    ea.accept(accept);
+    eb.connect(ForgedDial(dial, STRANGER));
+    a.journal().unwrap().publish::<Synced>(1).unwrap();
+    until("b refuses", || refused(&seen));
+    assert!(!eb.wait_connected(Duration::from_millis(200)));
+    assert!(!ea.stats().connected && !eb.stats().connected);
+    assert!(hb.lock().unwrap().is_empty(), "nothing crossed");
+    let events = seen.lock().unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, LinkEvent::Connected { .. }))
+    );
+    let reason = events
+        .iter()
+        .find_map(|e| match e {
+            LinkEvent::Refused { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(reason.contains(&STRANGER.to_string()), "{reason}");
+}
+
+#[test]
+fn a_peer_of_another_user_is_refused_by_the_accepting_side() {
+    let (a, b) = (bus(1024), bus(1024));
+    let hb = heard(&b);
+    let (dial, accept) = pipe::pair();
+    let ea = Endpoint::new(a.clone(), Config::new("a", Origin::process("b"))).unwrap();
+    let eb = Endpoint::new(b.clone(), b_config().reconnect(Duration::from_millis(20))).unwrap();
+    let seen = events(&ea);
+    ea.accept(ForgedAccept(accept, STRANGER));
+    eb.connect(dial);
+    a.journal().unwrap().publish::<Synced>(1).unwrap();
+    until("a refuses", || refused(&seen));
+    assert!(!ea.wait_connected(Duration::from_millis(200)));
+    assert!(hb.lock().unwrap().is_empty(), "nothing crossed");
+}
+
+#[test]
+fn a_listed_uid_is_let_in() {
+    let (a, b) = (bus(1024), bus(1024));
+    let hb = heard(&b);
+    let (dial, accept) = pipe::pair();
+    let config = b_config().peer_policy(PeerPolicy::Uids([STRANGER].into()));
+    let (_ea, eb) = join(&a, &b, config, (ForgedDial(dial, STRANGER), accept));
+    assert!(eb.stats().connected);
+    a.journal().unwrap().publish::<Synced>(3).unwrap();
+    until("b hears 3", || *hb.lock().unwrap() == [3]);
+}
+
+#[test]
+fn any_lets_every_peer_in() {
+    let (a, b) = (bus(1024), bus(1024));
+    let (dial, accept) = pipe::pair();
+    let config = b_config().peer_policy(PeerPolicy::Any);
+    let (_ea, eb) = join(&a, &b, config, (ForgedDial(dial, STRANGER), accept));
+    assert!(eb.stats().connected);
+}
+
 #[cfg(all(unix, feature = "unix"))]
 mod unix {
     use super::*;
@@ -433,6 +568,73 @@ mod unix {
         .unwrap();
         let out = a.alter::<Delete>("/x".into(), Vec::new());
         assert_eq!(out.value, ["b.vault"]);
+    }
+
+    /// This process's uid, read without `unsafe`: the owner of a file
+    /// it creates.
+    fn my_uid() -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        let file = path("uid");
+        std::fs::write(&file, b"").unwrap();
+        let uid = std::fs::metadata(&file).unwrap().uid();
+        std::fs::remove_file(&file).unwrap();
+        uid
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn the_socket_reads_the_peers_uid() {
+        let (here, _there) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(here.peer_identity().unwrap(), PeerIdentity::Uid(my_uid()));
+    }
+
+    #[test]
+    fn a_peer_of_the_same_user_passes_unflagged() {
+        let path = path("same-user");
+        let (a, b) = (bus(1024), bus(1024));
+        let ea = Endpoint::new(a.clone(), Config::new("a", Origin::process("b"))).unwrap();
+        let seen = events(&ea);
+        ea.accept(UnixAcceptor::bind(&path).unwrap());
+        let eb = Endpoint::new(b.clone(), b_config()).unwrap();
+        let seen_b = events(&eb);
+        eb.connect(UnixDialer::new(&path));
+        assert!(ea.wait_connected(WAIT) && eb.wait_connected(WAIT));
+        let flagged = |seen: &Mutex<Vec<LinkEvent>>| {
+            seen.lock().unwrap().iter().any(|e| {
+                matches!(
+                    e,
+                    LinkEvent::Refused { .. } | LinkEvent::PeerUnverified { .. }
+                )
+            })
+        };
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos"
+        )) {
+            assert!(!flagged(&seen) && !flagged(&seen_b));
+        }
+    }
+
+    #[test]
+    fn a_socket_peer_not_listed_is_refused() {
+        let path = path("not-listed");
+        let (a, b) = (bus(1024), bus(1024));
+        let hb = heard(&b);
+        let only = PeerPolicy::Uids([my_uid().wrapping_add(1)].into());
+        let ea = Endpoint::new(
+            a.clone(),
+            Config::new("a", Origin::process("b")).peer_policy(only),
+        )
+        .unwrap();
+        let seen = events(&ea);
+        ea.accept(UnixAcceptor::bind(&path).unwrap());
+        let eb = Endpoint::new(b.clone(), b_config().reconnect(Duration::from_millis(20))).unwrap();
+        eb.connect(UnixDialer::new(&path));
+        a.journal().unwrap().publish::<Synced>(1).unwrap();
+        until("a refuses", || refused(&seen));
+        assert!(!eb.wait_connected(Duration::from_millis(200)));
+        assert!(hb.lock().unwrap().is_empty(), "nothing crossed");
     }
 
     #[test]

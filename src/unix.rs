@@ -2,11 +2,21 @@
 //! processes of one machine.
 //!
 //! The accepting side binds a socket file ([`UnixAcceptor::bind`]) and
-//! makes it readable and writable by its own user only (mode `0600`):
-//! that file mode is the peer check of this release, so only processes
-//! of the same user can connect. Put the socket in a directory that
-//! user owns (`$XDG_RUNTIME_DIR`, for instance). The connecting side
-//! ([`UnixDialer`]) dials the path again each time the link reconnects.
+//! makes it readable and writable by its own user only (mode `0600`).
+//! Put the socket in a directory that user owns (`$XDG_RUNTIME_DIR`, for
+//! instance). The connecting side ([`UnixDialer`]) dials the path again
+//! each time the link reconnects.
+//!
+//! # Peer identity
+//!
+//! On each connection, both sides read the peer's user id from the
+//! kernel and check it against [`Config::peer_policy`](crate::Config::peer_policy)
+//! before the handshake: `SO_PEERCRED` on Linux and Android (through
+//! rustix), `getpeereid` on macOS, iOS and the BSDs (through nix). On a
+//! Unix with neither, the peer is [`PeerIdentity::Unknown`]: the default
+//! policy then relies on the file mode `0600` alone and says so
+//! ([`LinkEvent::PeerUnverified`](crate::LinkEvent::PeerUnverified)),
+//! and a policy naming uids refuses every peer.
 
 use std::fmt;
 use std::io;
@@ -17,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::peer::PeerIdentity;
 use crate::transport::{Accept, Dial, Stream};
 
 impl Stream for UnixStream {
@@ -27,6 +38,46 @@ impl Stream for UnixStream {
     fn shutdown(&self) {
         let _ = UnixStream::shutdown(self, Shutdown::Both);
     }
+
+    fn peer_identity(&self) -> io::Result<PeerIdentity> {
+        peer_identity(self)
+    }
+}
+
+/// The peer's user id, from the kernel.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_identity(stream: &UnixStream) -> io::Result<PeerIdentity> {
+    let cred = rustix::net::sockopt::socket_peercred(stream)?;
+    Ok(PeerIdentity::Uid(cred.uid.as_raw()))
+}
+
+/// The peer's user id, from the kernel.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn peer_identity(stream: &UnixStream) -> io::Result<PeerIdentity> {
+    let (uid, _) = nix::unistd::getpeereid(stream).map_err(io::Error::from)?;
+    Ok(PeerIdentity::Uid(uid.as_raw()))
+}
+
+/// No peer credential call this crate knows on this platform.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+fn peer_identity(_: &UnixStream) -> io::Result<PeerIdentity> {
+    Ok(PeerIdentity::Unknown)
 }
 
 /// The connecting side: dials a socket path.

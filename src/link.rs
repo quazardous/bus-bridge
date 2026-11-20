@@ -14,6 +14,7 @@ use bus_contract_crossing::{
 };
 use bus_contract_journal::BusJournal;
 
+use crate::peer::{PeerPolicy, Verdict, own_uid};
 use crate::transport::{Accept, Dial, Stream};
 use crate::wire::{self, Call, Frame, Outcome, PROTOCOL, Receipt, Reply};
 
@@ -57,12 +58,17 @@ pub struct Config {
     /// Turn it on only for a peer trusted to speak for others (a hub that
     /// forwards for its own peers, or a conformance run).
     pub trust_claimed_origin: bool,
+    /// Which peers the link accepts, checked on every connection before
+    /// the handshake ([`PeerPolicy`]). [`PeerPolicy::SameUser`] by
+    /// default; [`PeerPolicy::Any`] is unsafe on a host with several
+    /// users.
+    pub peer_policy: PeerPolicy,
 }
 
 impl Config {
     /// A link named `name` whose peer is `peer`: 64 in flight, frames of
     /// 256 entries, reconnect after 100 ms, poll every 20 ms, calls wait
-    /// 5 s, claimed origins not trusted.
+    /// 5 s, claimed origins not trusted, peers of this user only.
     pub fn new(name: impl Into<String>, peer: Origin) -> Config {
         Config {
             name: name.into(),
@@ -73,7 +79,14 @@ impl Config {
             poll: Duration::from_millis(20),
             call_timeout: Duration::from_secs(5),
             trust_claimed_origin: false,
+            peer_policy: PeerPolicy::SameUser,
         }
+    }
+
+    /// With another peer policy ([`Config::peer_policy`]).
+    pub fn peer_policy(mut self, policy: PeerPolicy) -> Config {
+        self.peer_policy = policy;
+        self
     }
 
     /// With another bound on work in flight ([`Config::max_in_flight`]),
@@ -140,6 +153,21 @@ pub enum LinkEvent {
     },
     /// What the peer did with an entry this end sent.
     Receipt(Receipt),
+    /// The peer failed the link's peer check ([`Config::peer_policy`]):
+    /// the connection was closed before the handshake, nothing crossed.
+    /// The connecting side dials again after [`Config::reconnect`].
+    Refused {
+        /// Why.
+        reason: String,
+    },
+    /// The peer was let in without its identity being read: the
+    /// transport or the platform has no peer credentials, and the
+    /// policy ([`PeerPolicy::SameUser`]) falls back to the transport's
+    /// own access control (the Unix socket's file mode `0600`).
+    PeerUnverified {
+        /// Why.
+        reason: String,
+    },
 }
 
 /// A link's counters at a moment ([`Endpoint::stats`]).
@@ -308,6 +336,7 @@ impl Endpoint {
             .spawn(move || {
                 while !inner.is_closed() {
                     match dial.dial() {
+                        Ok(stream) if !inner.admit(&*stream) => stream.shutdown(),
                         Ok(stream) => {
                             let reason = inner.session(stream);
                             inner.emit(&LinkEvent::Disconnected { reason });
@@ -338,6 +367,7 @@ impl Endpoint {
             .spawn(move || {
                 while !inner.is_closed() {
                     match accept.accept(inner.config.poll.max(Duration::from_millis(5))) {
+                        Ok(Some(stream)) if !inner.admit(&*stream) => stream.shutdown(),
                         Ok(Some(stream)) => {
                             let reason = inner.session(stream);
                             inner.emit(&LinkEvent::Disconnected { reason });
@@ -477,6 +507,26 @@ impl Inner {
 
     fn relay(&self) -> &dyn Relay {
         self.bus.relay().expect("checked at Endpoint::new")
+    }
+
+    /// Checks the peer of a new connection against the policy; reports
+    /// a refusal or an unverified peer.
+    fn admit(&self, stream: &dyn Stream) -> bool {
+        let verdict = match stream.peer_identity() {
+            Ok(peer) => self.config.peer_policy.check(&peer, own_uid()),
+            Err(e) => Verdict::Refuse(format!("cannot read the peer's credentials: {e}")),
+        };
+        match verdict {
+            Verdict::Pass => true,
+            Verdict::Unverified(reason) => {
+                self.emit(&LinkEvent::PeerUnverified { reason });
+                true
+            }
+            Verdict::Refuse(reason) => {
+                self.emit(&LinkEvent::Refused { reason });
+                false
+            }
+        }
     }
 
     fn emit(&self, event: &LinkEvent) {

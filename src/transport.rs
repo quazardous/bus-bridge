@@ -13,6 +13,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
+use crate::peer::PeerIdentity;
+
 /// A connection: bytes both ways. The link reads it on one thread and
 /// writes it from others, through a clone.
 pub trait Stream: Read + Write + Send {
@@ -22,6 +24,17 @@ pub trait Stream: Read + Write + Send {
     /// Closes the connection both ways: a blocked read on any handle
     /// returns.
     fn shutdown(&self);
+
+    /// Who the peer is, read from the connection, for the link's peer
+    /// check ([`crate::Config::peer_policy`]). An error refuses the
+    /// peer: a transport that should know and cannot fails closed.
+    ///
+    /// The default is [`PeerIdentity::Unknown`]: the transport cannot
+    /// tell, and the link relies on the transport's own access control
+    /// (see [`PeerPolicy::SameUser`](crate::PeerPolicy::SameUser)).
+    fn peer_identity(&self) -> io::Result<PeerIdentity> {
+        Ok(PeerIdentity::Unknown)
+    }
 }
 
 /// The connecting side of a transport: opens a connection to the peer,
@@ -133,6 +146,10 @@ pub mod memory {
         fn shutdown(&self) {
             self.incoming.close();
             self.outgoing.close();
+        }
+
+        fn peer_identity(&self) -> io::Result<PeerIdentity> {
+            Ok(PeerIdentity::SameProcess)
         }
     }
 

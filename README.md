@@ -37,6 +37,10 @@ reference implementation).
   endpoints in one process; `unix` (feature `unix`) joins two processes
   over a Unix socket whose file is readable by its owner only. Both
   carry the same length-prefixed frames (`wire`).
+- **Peer check.** On every connection, both ends check who the peer is
+  before the handshake (`Config::peer_policy`): by default its user id,
+  read by the kernel, must be this process's. A refused peer is closed
+  and reported (`LinkEvent::Refused`); nothing crosses.
 - **Conformance across the link.** `RemoteRelay` calls a peer's relay
   through the link, and `LinkedBus` is a bus whose relay is a remote
   one. The tests run bus-kernel's whole crossing conformance group on
@@ -63,6 +67,25 @@ desktop.listen_far(PointKey::of::<Delete>(), "node", Duration::from_secs(2), Lis
 Over a socket, the node binds `bus_bridge::unix::UnixAcceptor::bind(path)`
 and the desktop dials `bus_bridge::unix::UnixDialer::new(path)`.
 
+### Peer policy
+
+`Config::peer_policy` (also parsed from text, for a configuration file):
+
+| Policy | Text | Who gets in |
+|---|---|---|
+| `PeerPolicy::SameUser` (default) | `same-user` | A peer running as this process's user. |
+| `PeerPolicy::Uids(set)` | `uids:1000,1001` | A peer running as one of these users. A peer whose user cannot be read is refused. |
+| `PeerPolicy::Any` | `any` | Anyone the socket lets connect. **Unsafe on a host with several users** unless access to the socket is controlled otherwise. |
+
+The peer's user id comes from the kernel: `SO_PEERCRED` on Linux and
+Android (through [rustix](https://crates.io/crates/rustix)),
+`getpeereid` on macOS, iOS and the BSDs (through
+[nix](https://crates.io/crates/nix)); the crate itself has no `unsafe`.
+On a Unix with neither call, `same-user` falls back to the socket
+file's mode `0600` and reports each connection it let in that way
+(`LinkEvent::PeerUnverified`). The in-process transport's peer is the
+process itself, so every policy lets it in.
+
 ## What crossing over this bridge guarantees, and what it does not
 
 What crossing *means* is the contract's: read the crossing section of
@@ -77,7 +100,8 @@ first. This bridge adds what the transport decides.
 | **Duplicates** | None across a reconnection: an entry the receiver already took is dropped (a `Duplicate` receipt). | After the *receiving* process restarts, it starts from nothing and gets the sender's whole window again, entries it took before included. |
 | **Asks** | With no link, or no answer within the ask's deadline (link dropped, peer slow, asks in flight at their bound), the request is refused: no answer is a no. | An ask is never sent again by the link. **Not a distributed transaction**: what the far side's listeners did before the deadline ran out is not undone. |
 | **Back-pressure** | At most `max_in_flight` entries, asks and answers in flight per link. A full flow waits (entries in the sender's journal, asks within their deadline) and is reported. | A journal that overflows its window while the flow waits loses entries (reported as above). |
-| **Origin** | Every entry taken in and every ask answered carries the link's configured peer origin. | Security: the Unix socket file is mode `0600`, that is all. No encryption, no authentication beyond the file mode. The contract's authorities protect against mistakes, not attackers. |
+| **Origin** | Every entry taken in and every ask answered carries the link's configured peer origin. | The origin names the link, not a person: the contract's authorities protect against mistakes, not attackers. |
+| **Peer identity** | Both ends check the peer's user id, read by the kernel, against `Config::peer_policy` before the handshake (same user by default); a refused peer is closed and reported, and nothing crosses. On a Unix with no peer credential call, the default relies on the socket file's mode `0600` and says so. | No identity finer than the user id: any process of an allowed user gets in. No encryption. `PeerPolicy::Any` checks nothing. |
 
 TCP, TLS and remote discovery are not part of this release; the
 `Dial` / `Accept` / `Stream` traits leave room for them.
