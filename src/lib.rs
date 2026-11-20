@@ -74,9 +74,18 @@
 //!   entries, reported as above.
 //! - **Origin.** Every entry taken in and every ask answered carries
 //!   [`Config::peer`]: the link decides who the peer is, not the peer.
-//!   The Unix socket is made readable by its owner only; there is no
-//!   encryption and no authentication beyond that. The contract's
-//!   authorities protect against mistakes, not attackers.
+//!   The contract's authorities protect against mistakes, not
+//!   attackers.
+//! - **Peer identity.** On every connection, both ends check the peer
+//!   against [`Config::peer_policy`] before the handshake: by default
+//!   the peer must run as this process's user, read by the kernel
+//!   (`SO_PEERCRED` on Linux and Android, `getpeereid` on macOS and the
+//!   BSDs). A refused peer is closed and reported
+//!   ([`LinkEvent::Refused`]); nothing crosses. Where the platform has
+//!   no peer credential call, the default falls back to the Unix
+//!   socket's file mode `0600` and reports it
+//!   ([`LinkEvent::PeerUnverified`]). There is no encryption, and no
+//!   identity finer than the user id.
 //! - **Persistence.** None. A cursor is kept in memory, by the
 //!   receiving end, for as long as its process runs.
 //!
@@ -97,6 +106,7 @@
 #![warn(missing_docs)]
 
 mod link;
+pub mod peer;
 mod remote;
 pub mod transport;
 #[cfg(all(unix, feature = "unix"))]
@@ -104,6 +114,7 @@ pub mod unix;
 pub mod wire;
 
 pub use link::{Config, Endpoint, Flow, LinkError, LinkEvent, LinkStats};
+pub use peer::{PeerIdentity, PeerPolicy};
 pub use remote::{LinkedBus, RemoteRelay};
 
 pub use bus_contract;

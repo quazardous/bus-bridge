@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0
+
+- Peer check on every connection, on the accepting and the dialing
+  side, before the handshake: `Config::peer_policy` (a new field, hence
+  0.2.0) takes a `PeerPolicy`: `SameUser` (the default: the peer's user
+  id must be this process's), `Uids(set)`, or `Any` (unchecked, unsafe
+  on a host with several users). It parses from and shows as
+  `same-user`, `uids:1000,1001` and `any`.
+- A refused peer is closed before anything crosses and reported as
+  `LinkEvent::Refused { reason }`; the dialing side dials again after
+  `Config::reconnect`.
+- The Unix socket transport reads the peer's user id from the kernel:
+  `SO_PEERCRED` on Linux and Android (rustix), `getpeereid` on macOS,
+  iOS and the BSDs (nix). The crate still forbids `unsafe`. On a Unix
+  with neither, `SameUser` falls back to the socket file's mode `0600`
+  and reports `LinkEvent::PeerUnverified { reason }`.
+- `transport::Stream` gains `peer_identity` (default
+  `PeerIdentity::Unknown`), so other transports can report who the
+  peer is; the in-process transport reports `PeerIdentity::SameProcess`.
+
 ## 0.1.0
 
 First release: reference transports for bus-contract's crossing
