@@ -203,6 +203,15 @@ pub enum LinkEvent {
         /// Why.
         reason: String,
     },
+    /// This end asked to start from the peer's present
+    /// ([`Start::Present`]) and the peer answered with it: entries after
+    /// `cursor` will be taken in, none before. Reported before any of
+    /// them is, so a sink can draw the line between what came by another
+    /// way and what comes by the link.
+    FromPresent {
+        /// The peer's cursor at the handshake.
+        cursor: Cursor,
+    },
 }
 
 /// A link's counters at a moment ([`Endpoint::stats`]).
@@ -268,6 +277,9 @@ struct State {
     taken: Cursor,
     /// Where the next entries sent start, in this end's journal.
     out: Cursor,
+    /// This connection's handshake asked for the peer's present, not
+    /// answered yet.
+    asked_present: bool,
     entries_in_flight: usize,
     asks: HashMap<(u64, u64), Sender<RelayedAnswer>>,
     asks_in_flight: usize,
@@ -615,6 +627,7 @@ impl Inner {
             } else {
                 s.taken
             };
+            s.asked_present = resume == wire::RESUME_PRESENT;
             (conn, resume)
         };
         if self.is_closed() {
@@ -705,6 +718,10 @@ impl Inner {
                 lost,
                 next,
             } => {
+                let asked_present = std::mem::take(&mut self.lock().asked_present);
+                if asked_present && entries.is_empty() && lost.is_none() {
+                    self.emit(&LinkEvent::FromPresent { cursor: next });
+                }
                 if let Some(lost) = lost {
                     self.lost.fetch_add(1, Ordering::Relaxed);
                     self.emit(&LinkEvent::Lost(lost));

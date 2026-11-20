@@ -328,11 +328,21 @@ fn a_first_connection_can_start_from_the_peer_present() {
     let config = b_config()
         .start(Start::Present)
         .reconnect(Duration::from_millis(50));
-    let (ea, eb) = join(&a, &b, config, pipe::pair());
+    let ea = Endpoint::new(a.clone(), Config::new("a", Origin::process("b"))).unwrap();
+    let eb = Endpoint::new(b.clone(), config).unwrap();
     let seen = events(&eb);
+    let (dial, accept) = pipe::pair();
+    ea.accept(accept);
+    eb.connect(dial);
+    assert!(ea.wait_connected(WAIT) && eb.wait_connected(WAIT));
     // The peer's present is taken at the handshake, before anything
     // new is sent.
     until("b took a's present", || eb.stats().taken.seq == 5);
+    let from = seen.lock().unwrap().iter().find_map(|e| match e {
+        LinkEvent::FromPresent { cursor } => Some(*cursor),
+        _ => None,
+    });
+    assert_eq!(from, Some(eb.stats().taken), "reported");
 
     // A reconnection with nothing sent meanwhile resumes from there,
     // not from the oldest entry.
