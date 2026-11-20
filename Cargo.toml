@@ -1,6 +1,6 @@
 [package]
 name = "bus-bridge"
-version = "0.2.0"
+version = "0.2.1"
 description = "Reference transports for bus-contract's crossing contract: a link that carries relayable events and requests between two buses, in one process or over a Unix socket, with reconnection from a cursor and bounded in-flight work"
 readme = "README.md"
 keywords = ["event-bus", "ipc", "bus-contract", "relay", "unix-socket"]

@@ -113,7 +113,7 @@ pub mod transport;
 pub mod unix;
 pub mod wire;
 
-pub use link::{Config, Endpoint, Flow, LinkError, LinkEvent, LinkStats};
+pub use link::{Config, Endpoint, Flow, LinkError, LinkEvent, LinkStats, Start};
 pub use peer::{PeerIdentity, PeerPolicy};
 pub use remote::{LinkedBus, RemoteRelay};
 
